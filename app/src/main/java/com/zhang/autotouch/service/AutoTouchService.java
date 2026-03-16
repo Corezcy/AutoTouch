@@ -31,7 +31,7 @@ public class AutoTouchService extends AccessibilityService {
   private static final String TAG = "AT-Fast";
   private static final long FAST_POLL_MS = 100L;
   private static final long TAP_DURATION_MS = 20L;
-  private static final int BURST_COUNT = 3;
+  private static final int BURST_COUNT = 2;
   private static final long BURST_GAP_MS = 30L;
   private static final long HEART_BEAT_LOG_MS = 1000L;
   private static final long NO_SIGNAL_FORCE_REFRESH_MS = 6000L;
@@ -39,6 +39,13 @@ public class AutoTouchService extends AccessibilityService {
   private static final long BACK_WAIT_MAX_MS = 760L;
   private static final long REENTER_RETRY_MIN_MS = 240L;
   private static final long REENTER_RETRY_MAX_MS = 680L;
+  private static final long REENTER_SEARCH_AFTER_SWIPE_DELAY_MIN_MS = 1000L;
+  private static final long REENTER_SEARCH_AFTER_SWIPE_DELAY_MAX_MS = 1500L;
+  private static final int REENTER_SWIPE_UP_PX_MIN = 220;
+  private static final int REENTER_SWIPE_UP_PX_MAX = 520;
+  private static final int REENTER_SWIPE_PX_MIN = 400;
+  private static final int REENTER_SWIPE_PX_MAX = 700;
+  private static final int REENTER_MAX_SWIPE_SEARCH_COUNT = 2;
   private static final int POINT_DISABLED_CONFIRM_COUNT = 2;
   private static final int SOLD_OUT_CONFIRM_COUNT = 2;
   private static final long SOLD_OUT_TOAST_VALID_MS = 1200L;
@@ -73,6 +80,9 @@ public class AutoTouchService extends AccessibilityService {
   private static final int SOLD_OUT_MODE_STAY_PAGE = 2;
   private static final int SOLD_OUT_MODE = SOLD_OUT_MODE_BACK_REENTER;
   private static final String DEFAULT_TARGET_PACKAGE = "com.moutai.mall";
+  private static final int SWIPE_PHASE_NONE = 0;
+  private static final int SWIPE_PHASE_AFTER_UP = 1;
+  private static final int SWIPE_PHASE_AFTER_DOWN = 2;
 
   private TouchPoint autoTouchPoint;
   private final Handler handler = new Handler(Looper.getMainLooper());
@@ -89,6 +99,10 @@ public class AutoTouchService extends AccessibilityService {
   private long loopRound;
   private int pointDisabledCount;
   private int noSignalTimeoutCount;
+  private int reenterSwipeSearchCount;
+  private int reenterSwipePhase;
+  private boolean lastReenterActionWasSwipe;
+  private long lastReenterSwipeDelayMs;
   private String lastWindowPackage = "unknown";
   private String targetPackage = DEFAULT_TARGET_PACKAGE;
   private final Random random = new Random();
@@ -137,6 +151,10 @@ public class AutoTouchService extends AccessibilityService {
     soldOutCount = 0;
     pointDisabledCount = 0;
     noSignalTimeoutCount = 0;
+    reenterSwipeSearchCount = 0;
+    reenterSwipePhase = SWIPE_PHASE_NONE;
+    lastReenterActionWasSwipe = false;
+    lastReenterSwipeDelayMs = 0L;
     soldOutBackoffUntil = 0L;
     loopRound = 0;
     lastHeartBeatAt = 0L;
@@ -149,9 +167,10 @@ public class AutoTouchService extends AccessibilityService {
     }
     handler.removeCallbacks(fastLoopRunnable);
     handler.removeCallbacks(reenterRunnable);
-    Log.i(TAG, "fastMode START point=(" + autoTouchPoint.getX() + "," + autoTouchPoint.getY()
-        + ") keyword=" + autoTouchPoint.getName() + " soldOutMode=" + soldOutModeName()
-        + " targetPkg=" + targetPackage);
+    Log.i(TAG,
+        "fastMode START point=(" + autoTouchPoint.getX() + "," + autoTouchPoint.getY()
+            + ") keyword=" + autoTouchPoint.getName() + " soldOutMode=" + soldOutModeName()
+            + " targetPkg=" + targetPackage);
     handler.post(fastLoopRunnable);
   }
 
@@ -281,7 +300,8 @@ public class AutoTouchService extends AccessibilityService {
       // 强制刷新：长期没有识别信号时，连续两次超时后执行返回重进（不做自动滑动）
       if (now - lastSignalAt >= NO_SIGNAL_FORCE_REFRESH_MS) {
         noSignalTimeoutCount++;
-        Log.w(TAG, "no signal for " + (now - lastSignalAt) + "ms timeoutCount=" + noSignalTimeoutCount);
+        Log.w(TAG,
+            "no signal for " + (now - lastSignalAt) + "ms timeoutCount=" + noSignalTimeoutCount);
         lastSignalAt = now;
         if (noSignalTimeoutCount == 1) {
           Log.i(TAG, "no_signal_timeout first aid -> swipe disabled");
@@ -306,6 +326,10 @@ public class AutoTouchService extends AccessibilityService {
         Log.i(TAG, "reenter success");
         currentState = STATE_WATCH_BUY;
         reenterRetryCount = 0;
+        reenterSwipeSearchCount = 0;
+        reenterSwipePhase = SWIPE_PHASE_NONE;
+        lastReenterActionWasSwipe = false;
+        lastReenterSwipeDelayMs = 0L;
         soldOutBackoffUntil = System.currentTimeMillis() + 180L;
         scheduleFastLoop(FAST_POLL_MS);
         return;
@@ -313,11 +337,21 @@ public class AutoTouchService extends AccessibilityService {
       reenterRetryCount++;
       Log.i(TAG, "reenter retry=" + reenterRetryCount + "/" + REENTER_MAX_RETRY);
       if (reenterRetryCount <= REENTER_MAX_RETRY) {
-        handler.postDelayed(reenterRunnable, nextReenterRetryDelayMs());
+        long retryDelay =
+            lastReenterActionWasSwipe ? lastReenterSwipeDelayMs : nextReenterRetryDelayMs();
+        if (lastReenterActionWasSwipe) {
+          Log.i(TAG, "reenter retry after swipe delay=" + retryDelay + "ms");
+        }
+        lastReenterActionWasSwipe = false;
+        handler.postDelayed(reenterRunnable, retryDelay);
       } else {
         Log.w(TAG, "reenter failed: fallback to watch mode");
         currentState = STATE_WATCH_BUY;
         reenterRetryCount = 0;
+        reenterSwipeSearchCount = 0;
+        reenterSwipePhase = SWIPE_PHASE_NONE;
+        lastReenterActionWasSwipe = false;
+        lastReenterSwipeDelayMs = 0L;
         scheduleFastLoop(FAST_POLL_MS);
       }
     }
@@ -381,11 +415,42 @@ public class AutoTouchService extends AccessibilityService {
     if (!isEmpty(customKeyword)) {
       if (clickByText(root, customKeyword)) {
         Log.i(TAG, "reenter by custom keyword=" + customKeyword);
+        reenterSwipeSearchCount = 0;
+        reenterSwipePhase = SWIPE_PHASE_NONE;
+        lastReenterActionWasSwipe = false;
+        lastReenterSwipeDelayMs = 0L;
         return true;
       }
       Log.w(TAG, "reenter custom keyword not found=" + customKeyword);
+      if (reenterSwipePhase == SWIPE_PHASE_AFTER_DOWN) {
+        reenterSwipeSearchCount++;
+        reenterSwipePhase = SWIPE_PHASE_NONE;
+        Log.i(TAG,
+            "reenter search miss after swipe cycle " + reenterSwipeSearchCount + "/"
+                + REENTER_MAX_SWIPE_SEARCH_COUNT);
+      }
+      if (reenterSwipeSearchCount < REENTER_MAX_SWIPE_SEARCH_COUNT) {
+        if (reenterSwipePhase == SWIPE_PHASE_NONE) {
+          boolean upSwipeResult = swipeUpForReenterRefresh();
+          if (upSwipeResult) {
+            reenterSwipePhase = SWIPE_PHASE_AFTER_UP;
+            prepareSwipeRetryDelay();
+            Log.i(TAG, "reenter swipe-up then wait " + lastReenterSwipeDelayMs + "ms");
+            return false;
+          }
+        } else if (reenterSwipePhase == SWIPE_PHASE_AFTER_UP) {
+          boolean downSwipeResult = swipeDownForReenterSearch();
+          if (downSwipeResult) {
+            reenterSwipePhase = SWIPE_PHASE_AFTER_DOWN;
+            prepareSwipeRetryDelay();
+            Log.i(TAG, "reenter swipe-down then wait " + lastReenterSwipeDelayMs + "ms");
+            return false;
+          }
+        }
+      }
       if (STRICT_REENTER_WITH_CUSTOM_KEYWORD) {
-        boolean maybeDetailPage = containsText(root, BUY_TEXTS) || containsText(root, SOLD_OUT_TEXTS);
+        boolean maybeDetailPage =
+            containsText(root, BUY_TEXTS) || containsText(root, SOLD_OUT_TEXTS);
         if (maybeDetailPage) {
           boolean tapResult = tap(autoTouchPoint.getX(), autoTouchPoint.getY(), TAP_DURATION_MS);
           Log.i(TAG, "reenter by coordinate tap result=" + tapResult + " (strict_custom)");
@@ -487,10 +552,78 @@ public class AutoTouchService extends AccessibilityService {
     }
     reenterRetryCount = 0;
     noSignalTimeoutCount = 0;
+    reenterSwipeSearchCount = 0;
+    reenterSwipePhase = SWIPE_PHASE_NONE;
+    lastReenterActionWasSwipe = false;
+    lastReenterSwipeDelayMs = 0L;
     handler.removeCallbacks(reenterRunnable);
     long backWaitMs = nextBackWaitMs();
     Log.i(TAG, reason + " -> schedule reenter after " + backWaitMs + "ms");
     handler.postDelayed(reenterRunnable, backWaitMs);
+  }
+
+  private boolean swipeUpForReenterRefresh() {
+    int screenWidth = getResources().getDisplayMetrics().widthPixels;
+    int screenHeight = getResources().getDisplayMetrics().heightPixels;
+    if (screenWidth <= 0 || screenHeight <= 0) {
+      return false;
+    }
+    int x =
+        screenWidth / 2 + randomBetween(-(int) (screenWidth * 0.08f), (int) (screenWidth * 0.08f));
+    int startY = (int) (screenHeight * randomBetweenFloat(0.52f, 0.72f));
+    int distance = randomBetween(REENTER_SWIPE_UP_PX_MIN, REENTER_SWIPE_UP_PX_MAX);
+    int endY = Math.max(startY - distance, (int) (screenHeight * 0.18f));
+    if (endY >= startY) {
+      return false;
+    }
+    long duration = randomBetweenLong(240L, 420L);
+    Path path = new Path();
+    path.moveTo(x, startY);
+    path.lineTo(x, endY);
+    GestureDescription gesture =
+        new GestureDescription.Builder()
+            .addStroke(new GestureDescription.StrokeDescription(path, 0, duration))
+            .build();
+    boolean result = dispatchGesture(gesture, null, null);
+    Log.i(TAG,
+        "reenter swipe-up start=(" + x + "," + startY + ") end=(" + x + "," + endY
+            + ") distance=" + (startY - endY) + " dur=" + duration + "ms result=" + result);
+    return result;
+  }
+
+  private boolean swipeDownForReenterSearch() {
+    int screenWidth = getResources().getDisplayMetrics().widthPixels;
+    int screenHeight = getResources().getDisplayMetrics().heightPixels;
+    if (screenWidth <= 0 || screenHeight <= 0) {
+      return false;
+    }
+    int x =
+        screenWidth / 2 + randomBetween(-(int) (screenWidth * 0.08f), (int) (screenWidth * 0.08f));
+    int startY = (int) (screenHeight * randomBetweenFloat(0.30f, 0.48f));
+    int distance = randomBetween(REENTER_SWIPE_PX_MIN, REENTER_SWIPE_PX_MAX);
+    int endY = Math.min(startY + distance, (int) (screenHeight * 0.90f));
+    if (endY <= startY) {
+      return false;
+    }
+    long duration = randomBetweenLong(260L, 420L);
+    Path path = new Path();
+    path.moveTo(x, startY);
+    path.lineTo(x, endY);
+    GestureDescription gesture =
+        new GestureDescription.Builder()
+            .addStroke(new GestureDescription.StrokeDescription(path, 0, duration))
+            .build();
+    boolean result = dispatchGesture(gesture, null, null);
+    Log.i(TAG,
+        "reenter swipe-down start=(" + x + "," + startY + ") end=(" + x + "," + endY
+            + ") distance=" + (endY - startY) + " dur=" + duration + "ms result=" + result);
+    return result;
+  }
+
+  private void prepareSwipeRetryDelay() {
+    lastReenterSwipeDelayMs = randomBetweenLong(
+        REENTER_SEARCH_AFTER_SWIPE_DELAY_MIN_MS, REENTER_SEARCH_AFTER_SWIPE_DELAY_MAX_MS);
+    lastReenterActionWasSwipe = true;
   }
 
   private boolean containsText(AccessibilityNodeInfo root, String[] texts) {
@@ -617,6 +750,20 @@ public class AutoTouchService extends AccessibilityService {
     return min + (long) (random.nextDouble() * (max - min + 1));
   }
 
+  private int randomBetween(int min, int max) {
+    if (max <= min) {
+      return min;
+    }
+    return min + random.nextInt(max - min + 1);
+  }
+
+  private float randomBetweenFloat(float min, float max) {
+    if (max <= min) {
+      return min;
+    }
+    return min + random.nextFloat() * (max - min);
+  }
+
   private void bringTargetAppToFront() {
     if (isEmpty(targetPackage)) {
       targetPackage = DEFAULT_TARGET_PACKAGE;
@@ -654,12 +801,11 @@ public class AutoTouchService extends AccessibilityService {
       return;
     }
     lastHeartBeatAt = now;
-    Log.i(TAG, "heartbeat state=" + stateName(currentState)
-        + " loop=" + loopRound
-        + " soldOutBackoff=" + Math.max(0, soldOutBackoffUntil - now) + "ms"
-        + " retries=" + reenterRetryCount
-        + " idle=" + Math.max(0, now - lastSignalAt) + "ms"
-        + " pkg=" + lastWindowPackage);
+    Log.i(TAG,
+        "heartbeat state=" + stateName(currentState) + " loop=" + loopRound
+            + " soldOutBackoff=" + Math.max(0, soldOutBackoffUntil - now) + "ms"
+            + " retries=" + reenterRetryCount + " idle=" + Math.max(0, now - lastSignalAt) + "ms"
+            + " pkg=" + lastWindowPackage);
   }
 
   private String stateName(int state) {
